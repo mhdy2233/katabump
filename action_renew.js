@@ -587,6 +587,63 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
     return false;
 }
 
+async function getServerIds(page) {
+    console.log('正在获取服务器列表...');
+    await page.waitForSelector('.table tbody tr, .table, a[href*="/servers/edit"]', { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    let serverIds = [];
+    // 方式 1: 直接读取内部 API
+    try {
+        const apiData = await page.evaluate(async () => {
+            try {
+                const res = await fetch("/api-client/list-servers", { method: "GET" });
+                if (res.ok) return await res.json();
+            } catch (e) {}
+            return null;
+        });
+        if (Array.isArray(apiData) && apiData.length > 0) {
+            serverIds = apiData.map(s => String(s.id)).filter(Boolean);
+            console.log(`>> 通过内部 API 成功获取到 ${serverIds.length} 个服务器: ${serverIds.join(', ')}`);
+        }
+    } catch (e) {}
+
+    // 方式 2: 解析 DOM 中的 /servers/edit?id= 链接
+    if (serverIds.length === 0) {
+        try {
+            const links = await page.locator('a[href*="/servers/edit"]').all();
+            for (const l of links) {
+                const href = await l.getAttribute('href');
+                if (href) {
+                    const match = href.match(/id=(\d+)/);
+                    if (match && !serverIds.includes(match[1])) {
+                        serverIds.push(match[1]);
+                    }
+                }
+            }
+            if (serverIds.length > 0) {
+                console.log(`>> 通过 DOM 链接成功获取到 ${serverIds.length} 个服务器: ${serverIds.join(', ')}`);
+            }
+        } catch (e) {}
+    }
+
+    // 方式 3: 兼容旧版 "See" 按钮
+    if (serverIds.length === 0) {
+        try {
+            const seeLink = page.getByRole('link', { name: /see|voir|查看/i }).first();
+            if (await seeLink.isVisible({ timeout: 3000 })) {
+                const href = await seeLink.getAttribute('href');
+                const match = href ? href.match(/id=(\d+)/) : null;
+                if (match) {
+                    serverIds.push(match[1]);
+                }
+            }
+        } catch (e) {}
+    }
+
+    return serverIds;
+}
+
 (async () => {
   // Random delay for scheduled runs (anti-detection)
   if (GITHUB_EVENT_NAME === 'schedule') {
@@ -747,18 +804,20 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 console.log('登录错误:', e.message);
             }
 
-            console.log('正在寻找 "See" 链接...');
-            try {
-                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
-                await page.waitForTimeout(1000);
-                await page.getByRole('link', { name: 'See' }).first().click();
-            } catch (e) {
-                console.log('未找到 "See" 按钮。');
+            const serverIds = await getServerIds(page);
+            if (serverIds.length === 0) {
+                console.log('未找到任何服务器 (可能暂无服务器或未加载完成)。');
                 continue;
             }
 
-            // --- Renew 逻辑 ---
-            let renewSuccess = false;
+            for (let sIdx = 0; sIdx < serverIds.length; sIdx++) {
+                const serverId = serverIds[sIdx];
+                console.log(`\n=== 正在处理用户 ${user.username} 的服务器 [${sIdx + 1}/${serverIds.length}] ID: ${serverId} ===`);
+                await page.goto(`https://dashboard.katabump.com/servers/edit?id=${serverId}`);
+                await page.waitForTimeout(2000);
+
+                // --- Renew 逻辑 ---
+                let renewSuccess = false;
             // 2. 一个扁平化的主循环：尝试 Renew 整个流程 (最多 20 次)
             for (let attempt = 1; attempt <= 20; attempt++) {
                 let hasCaptchaError = false;
@@ -767,7 +826,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 // 我们直接开始寻找 Renew 按钮
                 console.log(`\n[尝试 ${attempt}/20] 正在寻找 Renew 按钮...`);
 
-                const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+                const renewBtn = page.locator('button[data-bs-target="#renew-modal"], button:has-text("Renew"), .btn-outline-primary').first();
                 try {
                     // 稍微等待一下，防止页面刚刷新还没渲染出来
                     await renewBtn.waitFor({ state: 'visible', timeout: 5000 });
@@ -836,7 +895,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                     }
 
                     // E. 准备点击确认
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
+                    const confirmBtn = modal.locator('button[type="submit"], button:has-text("Renew"), .btn-primary').first();
                     if (await confirmBtn.isVisible()) {
 
                         // User Requested: Screenshot BEFORE final click
@@ -938,6 +997,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 } else {
                     console.log('未找到 Renew 按钮 (服务器可能已续期或页面加载错误)。');
                     break;
+                }
                 }
             }
         } catch (err) {

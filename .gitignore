@@ -1,0 +1,8 @@
+node_modules/
+login.json
+ChromeData_Katabump/
+photo/
+screenshots/
+*.png
+*.html
+*.log
