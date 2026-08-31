@@ -670,16 +670,48 @@ async function getServerIds(page) {
                     try {
                         await renewBtn.waitFor({ state: 'visible', timeout: 5000 });
                     } catch (e) { }
-                    if (await renewBtn.isVisible()) {
-                        await renewBtn.click();
+
+                    let modalAppeared = false;
+                    const modal = page.locator('#renew-modal');
+
+                    if (await renewBtn.isVisible().catch(() => false)) {
+                        await renewBtn.scrollIntoViewIfNeeded().catch(() => {});
+                        await renewBtn.click({ force: true }).catch(() => {});
                         console.log('Renew button clicked. Waiting for modal...');
 
-                        const modal = page.locator('#renew-modal');
-                        try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {
-                            console.log('Modal did not appear? Retrying...');
-                            continue;
-                        }
+                        try {
+                            await modal.waitFor({ state: 'visible', timeout: 2500 });
+                            modalAppeared = true;
+                        } catch (e) {}
+                    }
 
+                    // 如果 DOM 点击未唤起模态框，尝试通过 Bootstrap API 直接呼出
+                    if (!modalAppeared) {
+                        console.log('DOM click did not trigger modal, opening via Bootstrap API...');
+                        await page.evaluate(() => {
+                            try {
+                                const mEl = document.querySelector('#renew-modal');
+                                if (mEl) {
+                                    if (window.bootstrap && window.bootstrap.Modal) {
+                                        window.bootstrap.Modal.getOrCreateInstance(mEl).show();
+                                    } else {
+                                        mEl.classList.add('show');
+                                        mEl.style.display = 'block';
+                                    }
+                                }
+                            } catch (err) {}
+                        });
+                        try {
+                            await modal.waitFor({ state: 'visible', timeout: 3000 });
+                            modalAppeared = true;
+                        } catch (e) {}
+                    }
+
+                    if (!modalAppeared) {
+                        console.log('Modal did not appear? Retrying...');
+                        await page.waitForTimeout(2000);
+                        continue;
+                    }
                         // 检查是否存在 Turnstile
                         let hasTurnstile = false;
                         for (const f of page.frames()) {
@@ -766,12 +798,8 @@ async function getServerIds(page) {
                             await page.waitForTimeout(3000);
                             continue;
                         }
-                    } else {
-                        console.log(`Renew button not found for server ${serverId} (might be already renewed).`);
-                        break;
                     }
                 }
-            }
 
         } catch (err) {
             console.error(`Error processing user ${user.username}:`, err);

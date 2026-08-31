@@ -219,7 +219,7 @@ async function launchChrome() {
         '--no-default-browser-check',
         // '--headless=new', // (已被注释) 使用 xvfb-run 时不需要 headless 模式，这样可以模拟有头浏览器增加成功率
         '--disable-gpu',
-        '--window-size=1280,720',
+        '--window-size=1920,1080',
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--user-data-dir=/tmp/chrome_user_data' // 必须指定用户数据目录，否则远程调试可能失败
@@ -697,6 +697,7 @@ async function getServerIds(page) {
     const context = browser.contexts()[0];
     let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(60000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
 
     if (PROXY_CONFIG && PROXY_CONFIG.username) {
         console.log('[代理] 正在设置认证...');
@@ -825,127 +826,152 @@ async function getServerIds(page) {
                 // 1. 如果是重试 (attempt > 1)，说明之前失败了或者刚刷新完页面
                 // 我们直接开始寻找 Renew 按钮
                 console.log(`\n[尝试 ${attempt}/20] 正在寻找 Renew 按钮...`);
-
                 const renewBtn = page.locator('button[data-bs-target="#renew-modal"], button:has-text("Renew"), .btn-outline-primary').first();
                 try {
-                    // 稍微等待一下，防止页面刚刷新还没渲染出来
                     await renewBtn.waitFor({ state: 'visible', timeout: 5000 });
                 } catch (e) { }
 
-                if (await renewBtn.isVisible()) {
-                    await renewBtn.click();
+                let modalAppeared = false;
+                const modal = page.locator('#renew-modal');
+
+                if (await renewBtn.isVisible().catch(() => false)) {
+                    await renewBtn.scrollIntoViewIfNeeded().catch(() => {});
+                    await renewBtn.click({ force: true }).catch(() => {});
                     console.log('Renew 按钮已点击。等待模态框...');
 
-                    const modal = page.locator('#renew-modal');
-                    try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {
-                        console.log('模态框未出现？重试中...');
-                        continue;
-                    }
+                    try {
+                        await modal.waitFor({ state: 'visible', timeout: 2500 });
+                        modalAppeared = true;
+                    } catch (e) {}
+                }
 
-                    // 检查是否存在 Turnstile
-                    let hasTurnstile = false;
-                    for (const f of page.frames()) {
-                        if (f.url().includes('challenges.cloudflare.com') || f.url().includes('turnstile')) {
-                            hasTurnstile = true;
+                // 如果 DOM 点击未唤起模态框，尝试通过 Bootstrap API 直接呼出
+                if (!modalAppeared) {
+                    console.log('DOM 点击未唤起模态框，尝试通过 Bootstrap API 唤起...');
+                    await page.evaluate(() => {
+                        try {
+                            const mEl = document.querySelector('#renew-modal');
+                            if (mEl) {
+                                if (window.bootstrap && window.bootstrap.Modal) {
+                                    window.bootstrap.Modal.getOrCreateInstance(mEl).show();
+                                } else {
+                                    mEl.classList.add('show');
+                                    mEl.style.display = 'block';
+                                }
+                            }
+                        } catch (err) {}
+                    });
+                    try {
+                        await modal.waitFor({ state: 'visible', timeout: 3000 });
+                        modalAppeared = true;
+                    } catch (e) {}
+                }
+
+                if (!modalAppeared) {
+                    console.log('模态框未出现？重试中...');
+                    await page.waitForTimeout(2000);
+                    continue;
+                }
+
+                // 检查是否存在 Turnstile
+                let hasTurnstile = false;
+                for (const f of page.frames()) {
+                    if (f.url().includes('challenges.cloudflare.com') || f.url().includes('turnstile')) {
+                        hasTurnstile = true;
+                        break;
+                    }
+                }
+                if (hasTurnstile) {
+                    console.log('正在检查 Turnstile (使用 CDP 绕过)...');
+                    await attemptTurnstileCdp(page);
+                    await page.waitForTimeout(3000);
+                }
+
+                const confirmBtn = modal.locator('button[type="submit"], button:has-text("Renew"), .btn-primary').first();
+                try {
+                    await confirmBtn.waitFor({ state: 'visible', timeout: 5000 });
+                } catch (e) {}
+
+                if (await confirmBtn.isVisible()) {
+                    const photoDir = path.join(process.cwd(), 'screenshots');
+                    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                    const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+                    const tsScreenshotName = `${safeUser}_renew_${serverId}_${attempt}.png`;
+                    try {
+                        await page.screenshot({ path: path.join(photoDir, tsScreenshotName) });
+                        console.log(`   >> 📸 快照已保存: ${tsScreenshotName}`);
+                    } catch (e) { }
+
+                    console.log('   >> 点击 Renew 确认按钮 (触发 ALTCHA 自动计算与表单提交)...');
+                    await confirmBtn.click({ force: true });
+
+                    // 等待 ALTCHA 自动计算完成并提交（通常 1~5 秒）
+                    const startVerifyTime = Date.now();
+                    while (Date.now() - startVerifyTime < 15000) {
+                        // A. 未到时间
+                        const notTimeLoc = page.getByText("You can't renew your server yet");
+                        if (await notTimeLoc.isVisible().catch(() => false)) {
+                            const text = await notTimeLoc.innerText().catch(() => '');
+                            const match = text.match(/as of\s+(.*?)\s+\(/);
+                            let dateStr = match ? match[1] : 'Unknown Date';
+                            console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
+
+                            const skipShotPath = path.join(photoDir, `${safeUser}_skip_${serverId}.png`);
+                            try { await page.screenshot({ path: skipShotPath }); } catch (e) { }
+                            await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n服务器 ID: ${serverId}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
+
+                            renewSuccess = true;
+                            try {
+                                const closeBtn = modal.getByLabel('Close');
+                                if (await closeBtn.isVisible()) await closeBtn.click();
+                            } catch (e) { }
                             break;
                         }
+
+                        // B. 验证码错误
+                        if (await page.getByText('Please complete the captcha to continue').isVisible().catch(() => false)) {
+                            console.log('   >> ⚠️ 检测到错误: "Please complete the captcha".');
+                            hasCaptchaError = true;
+                            break;
+                        }
+
+                        // C. 成功 (模态框消失)
+                        const modalVisible = await modal.isVisible().catch(() => false);
+                        if (!modalVisible) {
+                            console.log(`   >> ✅ 模态框已关闭，服务器 ${serverId} 续期成功！`);
+                            const successShotPath = path.join(photoDir, `${safeUser}_success_${serverId}.png`);
+                            try { await page.screenshot({ path: successShotPath }); } catch (e) { }
+                            await sendTelegramMessage(`✅ *续期成功*\n用户: ${user.username}\n服务器 ID: ${serverId}\n状态: 服务器已成功续期！`, successShotPath);
+                            renewSuccess = true;
+                            break;
+                        }
+
+                        await page.waitForTimeout(1000);
                     }
-                    if (hasTurnstile) {
-                        console.log('正在检查 Turnstile (使用 CDP 绕过)...');
-                        await attemptTurnstileCdp(page);
-                        await page.waitForTimeout(3000);
-                    }
 
-                    const confirmBtn = modal.locator('button[type="submit"], button:has-text("Renew"), .btn-primary').first();
-                    try {
-                        await confirmBtn.waitFor({ state: 'visible', timeout: 5000 });
-                    } catch (e) {}
+                    if (renewSuccess) break;
 
-                    if (await confirmBtn.isVisible()) {
-                        const photoDir = path.join(process.cwd(), 'screenshots');
-                        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const tsScreenshotName = `${safeUser}_renew_${serverId}_${attempt}.png`;
-                        try {
-                            await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
-                            console.log(`   >> 📸 快照已保存: ${tsScreenshotName}`);
-                        } catch (e) { }
-
-                        console.log('   >> 点击 Renew 确认按钮 (触发 ALTCHA 自动计算与表单提交)...');
-                        await confirmBtn.click();
-
-                        // 等待 ALTCHA 自动计算完成并提交（通常 1~5 秒）
-                        const startVerifyTime = Date.now();
-                        while (Date.now() - startVerifyTime < 15000) {
-                            // A. 未到时间
-                            const notTimeLoc = page.getByText("You can't renew your server yet");
-                            if (await notTimeLoc.isVisible().catch(() => false)) {
-                                const text = await notTimeLoc.innerText().catch(() => '');
-                                const match = text.match(/as of\s+(.*?)\s+\(/);
-                                let dateStr = match ? match[1] : 'Unknown Date';
-                                console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
-
-                                const skipShotPath = path.join(photoDir, `${safeUser}_skip_${serverId}.png`);
-                                try { await page.screenshot({ path: skipShotPath, fullPage: true }); } catch (e) { }
-                                await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n服务器 ID: ${serverId}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
-
-                                renewSuccess = true;
-                                try {
-                                    const closeBtn = modal.getByLabel('Close');
-                                    if (await closeBtn.isVisible()) await closeBtn.click();
-                                } catch (e) { }
-                                break;
-                            }
-
-                            // B. 验证码错误
-                            if (await page.getByText('Please complete the captcha to continue').isVisible().catch(() => false)) {
-                                console.log('   >> ⚠️ 检测到错误: "Please complete the captcha".');
-                                hasCaptchaError = true;
-                                break;
-                            }
-
-                            // C. 成功 (模态框消失)
-                            const modalVisible = await modal.isVisible().catch(() => false);
-                            if (!modalVisible) {
-                                console.log(`   >> ✅ 模态框已关闭，服务器 ${serverId} 续期成功！`);
-                                const successShotPath = path.join(photoDir, `${safeUser}_success_${serverId}.png`);
-                                try { await page.screenshot({ path: successShotPath, fullPage: true }); } catch (e) { }
-                                await sendTelegramMessage(`✅ *续期成功*\n用户: ${user.username}\n服务器 ID: ${serverId}\n状态: 服务器已成功续期！`, successShotPath);
-                                renewSuccess = true;
-                                break;
-                            }
-
-                            await page.waitForTimeout(1000);
-                        }
-
-                        if (renewSuccess) break;
-
-                        if (hasCaptchaError) {
-                            console.log('   >> 验证码重置，刷新页面重新尝试...');
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            continue;
-                        }
-
-                        // 如果超时仍打开，刷新重试
-                        if (await modal.isVisible().catch(() => false)) {
-                            console.log('   >> 模态框未关闭，刷新页面重试...');
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            continue;
-                        }
-                    } else {
-                        console.log('   >> 未找到模态框内的确认按钮？刷新重试...');
+                    if (hasCaptchaError) {
+                        console.log('   >> 验证码重置，刷新页面重新尝试...');
                         await page.reload();
                         await page.waitForTimeout(3000);
                         continue;
                     }
 
+                    // 如果超时仍打开，刷新重试
+                    if (await modal.isVisible().catch(() => false)) {
+                        console.log('   >> 模态框未关闭，刷新页面重试...');
+                        await page.reload();
+                        await page.waitForTimeout(3000);
+                        continue;
+                    }
                 } else {
-                    console.log('未找到 Renew 按钮 (服务器可能已续期或页面加载错误)。');
-                    break;
+                    console.log('   >> 未找到模态框内的确认按钮？刷新重试...');
+                    await page.reload();
+                    await page.waitForTimeout(3000);
+                    continue;
                 }
-                }
+            }
             }
         } catch (err) {
             console.error(`Error processing user:`, err);
