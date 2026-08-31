@@ -842,153 +842,100 @@ async function getServerIds(page) {
                         continue;
                     }
 
-                    // A. 在模态框里晃晃鼠标
-                    try {
-                        const box = await modal.boundingBox();
-                        if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
-                    } catch (e) { }
-
-                    // B. 找 Turnstile (小重试)
-                    console.log('正在检查 Turnstile (使用 CDP 绕过)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [寻找尝试 ${findAttempt + 1}/30] 尚未找到 Turnstile 复选框...`);
-                        await page.waitForTimeout(1000);
-                    }
-
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP 点击生效。等待 8秒 Cloudflare 检查...');
-                        await page.waitForTimeout(8000);
-                    } else {
-                        console.log('   >> 重试后仍未确认 Turnstile 复选框。');
-                    }
-
-                    // C. 检查 Success 标志
-                    const frames = page.frames();
-                    for (const f of frames) {
-                        if (f.url().includes('cloudflare')) {
-                            try {
-                                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                    console.log('   >> 在 Turnstile iframe 中检测到 "Success!"。');
-                                    isTurnstileSuccess = true;
-                                    break;
-                                }
-                            } catch (e) { }
-                        }
-                    }
-
-                    // D. ALTCHA Captcha 处理 (本地版本关键功能)
-                    const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 15, 8000);
-
-                    if (!altchaOk) {
-                        console.log('   >> ALTCHA 未通过，跳过确认按钮并刷新重试...');
-                        await page.reload();
-                        await page.waitForTimeout(3000);
-                        if (page.url().includes('login')) {
-                            console.log('   >> 刷新后被重定向到登录页，退出。');
+                    // 检查是否存在 Turnstile
+                    let hasTurnstile = false;
+                    for (const f of page.frames()) {
+                        if (f.url().includes('challenges.cloudflare.com') || f.url().includes('turnstile')) {
+                            hasTurnstile = true;
                             break;
                         }
-                        continue;
+                    }
+                    if (hasTurnstile) {
+                        console.log('正在检查 Turnstile (使用 CDP 绕过)...');
+                        await attemptTurnstileCdp(page);
+                        await page.waitForTimeout(3000);
                     }
 
-                    // E. 准备点击确认
                     const confirmBtn = modal.locator('button[type="submit"], button:has-text("Renew"), .btn-primary').first();
-                    if (await confirmBtn.isVisible()) {
+                    try {
+                        await confirmBtn.waitFor({ state: 'visible', timeout: 5000 });
+                    } catch (e) {}
 
-                        // User Requested: Screenshot BEFORE final click
-                        const fs = require('fs');
-                        const path = require('path');
+                    if (await confirmBtn.isVisible()) {
                         const photoDir = path.join(process.cwd(), 'screenshots');
                         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                         const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const tsScreenshotName = `${safeUser}_Turnstile_${attempt}.png`;
+                        const tsScreenshotName = `${safeUser}_renew_${serverId}_${attempt}.png`;
                         try {
                             await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
                             console.log(`   >> 📸 快照已保存: ${tsScreenshotName}`);
                         } catch (e) { }
 
-                        // User Request: 找不到的话这个循环直接下一步点击renew，然后检测有没有Please complete the captcha to continue
-                        console.log('   >> 点击 Renew 确认按钮 (无论 Turnstile 状态如何)...');
+                        console.log('   >> 点击 Renew 确认按钮 (触发 ALTCHA 自动计算与表单提交)...');
                         await confirmBtn.click();
 
-                        try {
-                            // 1. Check for Errors (Captcha or Date limit)
-                            const startVerifyTime = Date.now();
-                            while (Date.now() - startVerifyTime < 3000) {
-                                // A. Captcha Error
-                                if (await page.getByText('Please complete the captcha to continue').isVisible()) {
-                                    console.log('   >> ⚠️ 检测到错误: "Please complete the captcha".');
-                                    hasCaptchaError = true;
-                                    break;
-                                }
+                        // 等待 ALTCHA 自动计算完成并提交（通常 1~5 秒）
+                        const startVerifyTime = Date.now();
+                        while (Date.now() - startVerifyTime < 15000) {
+                            // A. 未到时间
+                            const notTimeLoc = page.getByText("You can't renew your server yet");
+                            if (await notTimeLoc.isVisible().catch(() => false)) {
+                                const text = await notTimeLoc.innerText().catch(() => '');
+                                const match = text.match(/as of\s+(.*?)\s+\(/);
+                                let dateStr = match ? match[1] : 'Unknown Date';
+                                console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
 
-                                // B. Not Renew Time Error
-                                const notTimeLoc = page.getByText("You can't renew your server yet");
-                                if (await notTimeLoc.isVisible()) {
-                                    const text = await notTimeLoc.innerText();
-                                    const match = text.match(/as of\s+(.*?)\s+\(/);
-                                    let dateStr = match ? match[1] : 'Unknown Date';
-                                    console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
+                                const skipShotPath = path.join(photoDir, `${safeUser}_skip_${serverId}.png`);
+                                try { await page.screenshot({ path: skipShotPath, fullPage: true }); } catch (e) { }
+                                await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n服务器 ID: ${serverId}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
 
-                                    // 截图证明
-                                    const fs = require('fs');
-                                    const path = require('path');
-                                    const photoDir = path.join(process.cwd(), 'screenshots');
-                                    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                                    const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                                    const skipShotPath = path.join(photoDir, `${safeUser}_skip.png`);
-                                    try { await page.screenshot({ path: skipShotPath, fullPage: true }); } catch (e) { }
-
-                                    await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
-
-                                    renewSuccess = true; // Mark as done to stop retries
-                                    try {
-                                        const closeBtn = modal.getByLabel('Close');
-                                        if (await closeBtn.isVisible()) await closeBtn.click();
-                                    } catch (e) { }
-                                    break;
-                                }
-                                await page.waitForTimeout(200);
+                                renewSuccess = true;
+                                try {
+                                    const closeBtn = modal.getByLabel('Close');
+                                    if (await closeBtn.isVisible()) await closeBtn.click();
+                                } catch (e) { }
+                                break;
                             }
-                        } catch (e) { }
 
-                        if (renewSuccess) break; // Break loop if not time yet
+                            // B. 验证码错误
+                            if (await page.getByText('Please complete the captcha to continue').isVisible().catch(() => false)) {
+                                console.log('   >> ⚠️ 检测到错误: "Please complete the captcha".');
+                                hasCaptchaError = true;
+                                break;
+                            }
 
-                        if (hasCaptchaError) {
-                            console.log('   >> Error found. Refreshing page to reset Turnstile...');
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            continue; // 刷新后，重新开始大循环
+                            // C. 成功 (模态框消失)
+                            const modalVisible = await modal.isVisible().catch(() => false);
+                            if (!modalVisible) {
+                                console.log(`   >> ✅ 模态框已关闭，服务器 ${serverId} 续期成功！`);
+                                const successShotPath = path.join(photoDir, `${safeUser}_success_${serverId}.png`);
+                                try { await page.screenshot({ path: successShotPath, fullPage: true }); } catch (e) { }
+                                await sendTelegramMessage(`✅ *续期成功*\n用户: ${user.username}\n服务器 ID: ${serverId}\n状态: 服务器已成功续期！`, successShotPath);
+                                renewSuccess = true;
+                                break;
+                            }
+
+                            await page.waitForTimeout(1000);
                         }
 
-                        // F. 检查成功 (模态框消失)
-                        await page.waitForTimeout(2000);
-                        if (!await modal.isVisible()) {
-                            console.log('   >> ✅ Modal closed. Renew successful!');
+                        if (renewSuccess) break;
 
-                            // 截图成功状态
-                            const fs = require('fs');
-                            const path = require('path');
-                            const photoDir = path.join(process.cwd(), 'screenshots');
-                            if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                            const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                            const successShotPath = path.join(photoDir, `${safeUser}_success.png`);
-                            try { await page.screenshot({ path: successShotPath, fullPage: true }); } catch (e) { }
+                        if (hasCaptchaError) {
+                            console.log('   >> 验证码重置，刷新页面重新尝试...');
+                            await page.reload();
+                            await page.waitForTimeout(3000);
+                            continue;
+                        }
 
-                            await sendTelegramMessage(`✅ *续期成功*\n用户: ${user.username}\n状态: 服务器已成功续期！`, successShotPath);
-                            renewSuccess = true;
-                            break;
-                        } else {
-                            console.log('   >> 模态框仍打开但无错误？重试循环...');
+                        // 如果超时仍打开，刷新重试
+                        if (await modal.isVisible().catch(() => false)) {
+                            console.log('   >> 模态框未关闭，刷新页面重试...');
                             await page.reload();
                             await page.waitForTimeout(3000);
                             continue;
                         }
                     } else {
-                        console.log('   >> 未找到模态框内的验证按钮？刷新中...');
+                        console.log('   >> 未找到模态框内的确认按钮？刷新重试...');
                         await page.reload();
                         await page.waitForTimeout(3000);
                         continue;

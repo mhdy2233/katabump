@@ -680,109 +680,82 @@ async function getServerIds(page) {
                             continue;
                         }
 
-                        try {
-                            const box = await modal.boundingBox();
-                            if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
-                        } catch (e) { }
-
-                        console.log('Checking for Turnstile (using CDP bypass)...');
-                        let cdpClickResult = false;
-                        for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                            cdpClickResult = await attemptTurnstileCdp(page);
-                            if (cdpClickResult) break;
-                            await page.waitForTimeout(1000);
-                        }
-
-                        let isTurnstileSuccess = false;
-                        if (cdpClickResult) {
-                            console.log('   >> CDP Click active. Waiting 8s for Cloudflare check...');
-                            await page.waitForTimeout(8000);
-                        } else {
-                            console.log('   >> Turnstile checkbox not confirmed after retries.');
-                        }
-
-                        const frames = page.frames();
-                        for (const f of frames) {
-                            if (f.url().includes('cloudflare')) {
-                                try {
-                                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                        console.log('   >> Detected "Success!" in Turnstile iframe.');
-                                        isTurnstileSuccess = true;
-                                        break;
-                                    }
-                                } catch (e) { }
-                            }
-                        }
-
-                        // ALTCHA Captcha Handling
-                        const altchaOk = await solveAltchaIfPresent(page, "Renew Modal", 15, 8000);
-                        if (!altchaOk) {
-                            console.log('   >> ALTCHA not passed, refreshing to retry...');
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            if (page.url().includes('login')) {
-                                console.log('   >> Redirected to login page after reload.');
+                        // 检查是否存在 Turnstile
+                        let hasTurnstile = false;
+                        for (const f of page.frames()) {
+                            if (f.url().includes('challenges.cloudflare.com') || f.url().includes('turnstile')) {
+                                hasTurnstile = true;
                                 break;
                             }
-                            continue;
+                        }
+                        if (hasTurnstile) {
+                            console.log('Checking for Turnstile (using CDP bypass)...');
+                            await attemptTurnstileCdp(page);
+                            await page.waitForTimeout(3000);
                         }
 
                         const confirmBtn = modal.locator('button[type="submit"], button:has-text("Renew"), .btn-primary').first();
+                        try {
+                            await confirmBtn.waitFor({ state: 'visible', timeout: 5000 });
+                        } catch (e) {}
+
                         if (await confirmBtn.isVisible()) {
                             const photoDir = path.join(__dirname, 'photo');
                             if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                             const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                            const tsScreenshotName = `${safeUser}_Turnstile_${serverId}_${attempt}.png`;
+                            const tsScreenshotName = `${safeUser}_renew_${serverId}_${attempt}.png`;
                             try {
                                 await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
                                 console.log(`   >> 📸 Snapshot saved: ${tsScreenshotName}`);
                             } catch (e) { }
 
-                            console.log('   >> Clicking Renew confirm button...');
+                            console.log('   >> Clicking Renew confirm button (triggers ALTCHA PoW auto-submit)...');
                             await confirmBtn.click();
 
-                            try {
-                                const startVerifyTime = Date.now();
-                                while (Date.now() - startVerifyTime < 3000) {
-                                    if (await page.getByText('Please complete the captcha to continue').isVisible()) {
-                                        console.log('   >> ⚠️ Error detected: "Please complete the captcha".');
-                                        hasCaptchaError = true;
-                                        break;
-                                    }
-
-                                    const notTimeLoc = page.getByText("You can't renew your server yet");
-                                    if (await notTimeLoc.isVisible()) {
-                                        const text = await notTimeLoc.innerText();
-                                        const match = text.match(/as of\s+(.*?)\s+\(/);
-                                        let dateStr = match ? match[1] : 'Unknown Date';
-                                        console.log(`   >> ⏳ Cannot renew yet. Next renewal available as of: ${dateStr}`);
-                                        renewSuccess = true;
-                                        try {
-                                            const closeBtn = modal.getByLabel('Close');
-                                            if (await closeBtn.isVisible()) await closeBtn.click();
-                                        } catch (e) { }
-                                        break;
-                                    }
-                                    await page.waitForTimeout(200);
+                            // 等待 ALTCHA 自动计算完成并提交（通常 1~5 秒）
+                            const startVerifyTime = Date.now();
+                            while (Date.now() - startVerifyTime < 15000) {
+                                const notTimeLoc = page.getByText("You can't renew your server yet");
+                                if (await notTimeLoc.isVisible().catch(() => false)) {
+                                    const text = await notTimeLoc.innerText().catch(() => '');
+                                    const match = text.match(/as of\s+(.*?)\s+\(/);
+                                    let dateStr = match ? match[1] : 'Unknown Date';
+                                    console.log(`   >> ⏳ Cannot renew yet. Next renewal available as of: ${dateStr}`);
+                                    renewSuccess = true;
+                                    try {
+                                        const closeBtn = modal.getByLabel('Close');
+                                        if (await closeBtn.isVisible()) await closeBtn.click();
+                                    } catch (e) { }
+                                    break;
                                 }
-                            } catch (e) { }
+
+                                if (await page.getByText('Please complete the captcha to continue').isVisible().catch(() => false)) {
+                                    console.log('   >> ⚠️ Error detected: "Please complete the captcha".');
+                                    hasCaptchaError = true;
+                                    break;
+                                }
+
+                                const modalVisible = await modal.isVisible().catch(() => false);
+                                if (!modalVisible) {
+                                    console.log(`   >> ✅ Modal closed. Server ${serverId} renewed successfully!`);
+                                    renewSuccess = true;
+                                    break;
+                                }
+
+                                await page.waitForTimeout(1000);
+                            }
 
                             if (renewSuccess) break;
 
                             if (hasCaptchaError) {
-                                console.log('   >> Error found. Refreshing page to reset Turnstile...');
+                                console.log('   >> Captcha error, refreshing to retry...');
                                 await page.reload();
                                 await page.waitForTimeout(3000);
                                 continue;
                             }
 
-                            await page.waitForTimeout(2000);
-                            if (!await modal.isVisible()) {
-                                console.log(`   >> ✅ Modal closed. Server ${serverId} renewed successfully!`);
-                                renewSuccess = true;
-                                break;
-                            } else {
-                                console.log('   >> Modal still open. Refreshing to retry...');
+                            if (await modal.isVisible().catch(() => false)) {
+                                console.log('   >> Modal still open after wait, refreshing to retry...');
                                 await page.reload();
                                 await page.waitForTimeout(3000);
                                 continue;
