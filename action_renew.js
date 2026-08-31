@@ -977,10 +977,7 @@ async function getServerIds(page) {
             console.error(`Error processing user:`, err);
         }
 
-        // Snapshot before handling next user
-        // In GitHub Actions, we save to 'screenshots' dir
-        const fs = require('fs');
-        const path = require('path');
+        // Snapshot before handling next user (In GitHub Actions, save to screenshots dir)
         const photoDir = path.join(process.cwd(), 'screenshots');
         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
         // Use safe filename
